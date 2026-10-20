@@ -645,10 +645,10 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
   <div class="lock-card">
     <div class="logo lock-logo">日</div>
     <h2>日笺</h2>
-    <p>输入密码解锁你的日记</p>
+    <p>输入密码，进入你的日记</p>
     <form id="unlockForm" autocomplete="on">
       <input id="unlockPass" type="password" placeholder="密码" autocomplete="current-password">
-      <button type="submit" id="unlockBtn">解锁</button>
+      <button type="submit" id="unlockBtn">进入</button>
     </form>
     <div class="lock-err" id="unlockErr"></div>
     <button class="link-btn" id="forgetBtn">忘记密码 / 换一个仓库</button>
@@ -679,7 +679,7 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
       </label>
       <div class="modal-err" id="cloudErr"></div>
       <button class="primary" id="cloudConnect">连接并同步</button>
-      <p class="modal-note">令牌只用你的密码加密后存在这台设备上，不会发到任何第三方服务器；仓库里只有日记本身。</p>
+      <p class="modal-note">令牌用你的密码加密保存：一份在本机，一份作为密文随站点公开存放（只有密文，没有密码解不开）。所以密码请设强一点，并记牢。</p>
     </div>
 
     <div id="cloudStatus" hidden>
@@ -1357,6 +1357,11 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
   const CLOUD_KEY = "rijian.cloud.v1";
   const GH_API = "https://api.github.com";
   const GH_FILE = "entries.json";
+  /* 站点仓库：公开，用来存放「用密码加密过的令牌」密文，这样任何设备输对密码都能进入 */
+  const SITE_OWNER = "csbsui";
+  const SITE_REPO  = "rijian";
+  const AUTH_FILE  = "auth.json";
+  const PBKDF2_ITER = 300000;
 
   const Cloud = (function(){
     let record = null;
@@ -1382,22 +1387,22 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
     const utf8dec = b => new TextDecoder().decode(b);
 
     /* ---- 用密码保护令牌 ---- */
-    async function deriveKey(pass, salt){
+    async function deriveKey(pass, salt, iter){
       const base = await crypto.subtle.importKey("raw", utf8enc(pass), "PBKDF2", false, ["deriveKey"]);
       return crypto.subtle.deriveKey(
-        { name: "PBKDF2", salt: salt, iterations: 150000, hash: "SHA-256" },
+        { name: "PBKDF2", salt: salt, iterations: iter || 150000, hash: "SHA-256" },
         base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
       );
     }
     async function seal(pass, token){
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const key = await deriveKey(pass, salt);
+      const key = await deriveKey(pass, salt, PBKDF2_ITER);
       const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, utf8enc(JSON.stringify({ token: token })));
-      return { salt: b64enc(salt), iv: b64enc(iv), ct: b64enc(new Uint8Array(ct)) };
+      return { salt: b64enc(salt), iv: b64enc(iv), ct: b64enc(new Uint8Array(ct)), iter: PBKDF2_ITER };
     }
     async function unseal(pass, rec){
-      const key = await deriveKey(pass, b64dec(rec.salt));
+      const key = await deriveKey(pass, b64dec(rec.salt), rec.iter || 150000);
       const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64dec(rec.iv) }, key, b64dec(rec.ct));
       return JSON.parse(utf8dec(pt)).token;
     }
@@ -1409,13 +1414,14 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
     };
     function api(path, opts){
       const o = opts || {};
-      return fetch(GH_API + path, Object.assign({}, o, {
+      return fetch(GH_API + path, Object.assign({ cache: "no-store" }, o, {
         headers: Object.assign({ "Authorization": "Bearer " + session.token }, GH_HEAD, o.headers || {})
       }));
     }
 
     async function checkRepo(owner, repo, token){
       const res = await fetch(GH_API + "/repos/" + owner + "/" + repo, {
+        cache: "no-store",
         headers: Object.assign({ "Authorization": "Bearer " + token }, GH_HEAD)
       });
       if(res.status === 401) throw new Error("令牌无效或已过期");
@@ -1480,14 +1486,16 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
       pushing = true;
       setMode("syncing");
       try{
-        let res = await put({ version: 1, updatedAt: new Date().toISOString(), entries: entries, tombstones: tombstones });
-        if(res.status === 409 || res.status === 422){
+        let res = null;
+        for(let attempt = 0; attempt < 3; attempt++){
+          res = await put({ version: 1, updatedAt: new Date().toISOString(), entries: entries, tombstones: tombstones });
+          if(res.status !== 409 && res.status !== 422) break;
+          /* 冲突：拉最新、合并、再推一次 */
           const remote = await pull();
           const m = mergeData(remote, { entries: entries, tombstones: tombstones });
           entries = m.entries;
           tombstones = m.tombstones;
           persist(); persistTomb(); refreshAll();
-          res = await put({ version: 1, updatedAt: new Date().toISOString(), entries: entries, tombstones: tombstones });
         }
         if(res.status === 401) throw new Error("令牌已失效，请重新连接");
         if(!res.ok) throw new Error("写入云端失败（HTTP " + res.status + "）");
@@ -1532,11 +1540,61 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
       return record;
     }
 
+    /* 站点上的加密令牌：任何设备都能取到密文，只有密码对才解得开 */
+    async function fetchAuth(){
+      try{
+        const res = await fetch(AUTH_FILE + "?t=" + Date.now(), { cache: "no-store" });
+        if(!res.ok) return null;
+        const j = await res.json();
+        if(!j || !j.ct || !j.salt || !j.iv) return null;
+        return j;
+      }catch(e){ return null; }
+    }
+
+    /* 首次设置时，把加密令牌写回站点仓库 */
+    async function writeAuth(token, rec){
+      const url = GH_API + "/repos/" + SITE_OWNER + "/" + SITE_REPO + "/contents/" + AUTH_FILE;
+      const head = Object.assign({ "Authorization": "Bearer " + token }, GH_HEAD);
+      let sha = null;
+      const cur = await fetch(url + "?ref=main", { cache: "no-store", headers: head });
+      if(cur.ok){ try{ sha = (await cur.json()).sha; }catch(e){} }
+      const body = {
+        message: "auth: 更新加密令牌",
+        content: b64enc(utf8enc(JSON.stringify(rec))),
+        branch: "main"
+      };
+      if(sha) body.sha = sha;
+      const res = await fetch(url, {
+        method: "PUT",
+        headers: Object.assign({ "Content-Type": "application/json" }, head),
+        body: JSON.stringify(body)
+      });
+      if(!res.ok) throw new Error("密码已保存在本机，但没能写入站点（HTTP " + res.status + "）：换设备登录需要令牌对 " + SITE_OWNER + "/" + SITE_REPO + " 有 Contents 写权限");
+    }
+
+    function showLock(){
+      setMode("locked");
+      $("#lockScreen").hidden = false;
+      setTimeout(() => { const el = $("#unlockPass"); if(el) el.focus(); }, 220);
+    }
+
+    async function boot(){
+      loadRecord();
+      /* 先上锁，避免日记正文在确认身份之前闪现 */
+      showLock();
+      if(record) return;
+      const auth = await fetchAuth();
+      if(auth){ record = auth; return; }
+      /* 站点上还没有密码记录：这是第一次设置 */
+      hideLock();
+      setMode("local");
+      openCloudModal();
+    }
+
     async function connect(owner, repo, token, pass){
       await checkRepo(owner, repo, token);
       const sealed = await seal(pass, token);
       record = Object.assign({ v: 1, owner: owner, repo: repo, createdAt: Date.now() }, sealed);
-      localStorage.setItem(CLOUD_KEY, JSON.stringify(record));
       session = { owner: owner, repo: repo, token: token };
       setMode("syncing");
       const remote = await pull();
@@ -1545,17 +1603,28 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
       tombstones = m.tombstones;
       persist(); persistTomb(); refreshAll();
       await push();
+      try{
+        await writeAuth(token, record);
+      }catch(e){
+        toast(e.message || "加密令牌没能写入站点，换设备需要重新设置");
+      }
+      try{ localStorage.setItem(CLOUD_KEY, JSON.stringify(record)); }catch(e){}
     }
 
     async function unlock(pass){
-      const token = await unseal(pass, record);
-      session = { owner: record.owner, repo: record.repo, token: token };
+      let rec = record;
+      if(!rec) rec = await fetchAuth();
+      if(!rec) throw new Error("没有找到密码记录，请重新设置一次");
+      const token = await unseal(pass, rec);
+      session = { owner: rec.owner, repo: rec.repo, token: token };
       setMode("syncing");
       const remote = await pull();
       const m = mergeData(remote, { entries: entries, tombstones: tombstones });
       entries = m.entries;
       tombstones = m.tombstones;
       persist(); persistTomb(); refreshAll();
+      record = rec;
+      try{ localStorage.setItem(CLOUD_KEY, JSON.stringify(rec)); }catch(e){}
       await push();
       hideLock();
     }
@@ -1564,17 +1633,6 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
       localStorage.removeItem(CLOUD_KEY);
       record = null; session = null; fileSha = null;
       setMode("local");
-    }
-
-    function boot(){
-      loadRecord();
-      if(record){
-        setMode("locked");
-        $("#lockScreen").hidden = false;
-        setTimeout(() => { const el = $("#unlockPass"); if(el) el.focus(); }, 220);
-      }else{
-        setMode("local");
-      }
     }
 
     function hideLock(){
@@ -1594,10 +1652,11 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
     const rec = Cloud.getRecord();
     $("#cloudForm").hidden = !!rec;
     $("#cloudStatus").hidden = !rec;
-    $("#cloudTitle").textContent = rec ? "云端同步" : "连接云端同步";
+    $("#cloudTitle").textContent = rec ? "云端同步" : "首次设置：连接你的日记仓库";
     $("#cloudErr").textContent = "";
     $("#cloudStatusErr").textContent = "";
     if(rec) $("#ghRepoLabel").textContent = rec.owner + "/" + rec.repo;
+    if(!rec && !$("#ghRepo").value.trim()) $("#ghRepo").value = "csbsui/diary-data";
     $("#cloudModal").hidden = false;
   }
   function closeCloudModal(){ $("#cloudModal").hidden = true; }
@@ -1694,9 +1753,13 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
     renderSheet();
     Cloud.boot();
 
-    // 打开就能写：今天还没写时自动聚焦
+    // 打开就能写：今天还没写时自动聚焦（锁屏时不要抢焦点）
     if(window.innerWidth > 880 && isEmptyDraft(draft)){
-      setTimeout(() => $("#editor").focus(), 320);
+      setTimeout(() => {
+        if(!$("#lockScreen").hidden) return;
+        if(!$("#cloudModal").hidden) return;
+        $("#editor").focus();
+      }, 320);
     }
   }
 
