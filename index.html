@@ -1683,10 +1683,9 @@ html[data-theme="dark"] .modal{background:rgba(0,0,0,.58)}
     });
 
     $("#forgetBtn").addEventListener("click", () => {
-      if(!window.confirm("忘记密码需要重新连接：云端日记不会删除，但要再填一次令牌。继续？")) return;
+      if(!window.confirm("清掉这台设备记住的密码，回到密码框重新输入？日记数据不会受影响。")) return;
       Cloud.disconnect();
-      Cloud.hideLock();
-      openCloudModal();
+      location.reload();
     });
 
     $("#syncPill").addEventListener("click", () => {
